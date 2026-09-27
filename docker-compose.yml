@@ -1,0 +1,104 @@
+# DevOps Agent Platform - local + production-compose stack.
+#
+#   docker compose up --build
+#
+# Services:
+#   postgres  PG16 + pgvector (data + vector store in one instance)
+#   redis     event queue + caching
+#   api       FastAPI (serves the API, consumes events in-process)
+#   worker    dedicated queue consumer (x2); disable in-process consumption
+#             for `api` in this topology via EVENT_CONSUMER_IN_PROCESS=false
+#
+# Secrets come from the environment (or a `.env` file next to this compose
+# file). Never commit real keys; see `.env.example` for the full list.
+version: "3.8"
+
+x-common-env: &common-env
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DEBUG: "false"
+  DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-devops_agents}
+  DATABASE_CREATE_SCHEMA: "false"  # alembic owns the schema in compose (see api/worker entrypoints)
+  REDIS_URL: redis://redis:6379/0
+  LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+  OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}
+  OAUTH2_CLIENT_ID: ${OAUTH2_CLIENT_ID:?OAUTH2_CLIENT_ID must be set}
+  OAUTH2_CLIENT_SECRET: ${OAUTH2_CLIENT_SECRET:?OAUTH2_CLIENT_SECRET must be set}
+  OAUTH2_AUTHORIZATION_URL: ${OAUTH2_AUTHORIZATION_URL:?set the SSO authorize URL}
+  OAUTH2_TOKEN_URL: ${OAUTH2_TOKEN_URL:?set the SSO token URL}
+  OAUTH2_USERINFO_URL: ${OAUTH2_USERINFO_URL:?set the SSO userinfo URL}
+  OAUTH2_REDIRECT_URI: ${OAUTH2_REDIRECT_URI:?set the SSO redirect URI}
+  GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?GITHUB_WEBHOOK_SECRET must be set}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-devops_agents}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-vector.sql:/docker-entrypoint-initdb.d/init-vector.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    environment:
+      <<: *common-env
+      EVENT_CONSUMER_IN_PROCESS: "false"  # dedicated workers consume events
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  worker:
+    build: .
+    environment:
+      <<: *common-env
+      EVENT_CONSUMER_IN_PROCESS: "false"  # this process IS the consumer
+    command: python -m app.events.consumer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+
+volumes:
+  postgres_data:
+  redis_data:
